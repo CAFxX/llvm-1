@@ -40,8 +40,9 @@ using namespace llvm;
 
 #define DEBUG_TYPE "icall-promotion"
 
-STATISTIC(NumOfPGOICallPromotion, "Number of indirect call promotions.");
-STATISTIC(NumOfPGOICallsites, "Number of indirect call candidate sites.");
+STATISTIC(NumOfPGOICallPromotion, "Number of indirect call promotions");
+STATISTIC(NumOfPGOICallsites, "Number of indirect call candidate sites");
+STATISTIC(NumOfPGOICallsitesSkipped, "Number of indirect callsites skipped");
 
 // Command line option to disable indirect-call promotion with the default as
 // false. This is for debug purpose.
@@ -177,6 +178,7 @@ private:
   // Test if we can legally promote this direct-call of Target.
   TargetStatus isPromotionLegal(Instruction *Inst, uint64_t Target,
                                 Function *&F);
+  TargetStatus isPromotionLegal(Instruction *Inst, Function *DirectCallee);
 
   // A struct that records the direct target and it's call count.
   struct PromotionCandidate {
@@ -256,6 +258,14 @@ ICallPromotionFunc::isPromotionLegal(Instruction *Inst, uint64_t Target,
   Function *DirectCallee = Symtab->getFunction(Target);
   if (DirectCallee == nullptr)
     return NotAvailableInModule;
+  ICallPromotionFunc::TargetStatus res = isPromotionLegal(Inst, DirectCallee);
+  if (res == OK)
+    TargetFunction = DirectCallee;
+  return res;
+}
+
+ICallPromotionFunc::TargetStatus
+ICallPromotionFunc::isPromotionLegal(Instruction *Inst, Function *DirectCallee) {
   // Check the return type.
   Type *CallRetType = Inst->getType();
   if (!CallRetType->isVoidTy()) {
@@ -284,8 +294,8 @@ ICallPromotionFunc::isPromotionLegal(Instruction *Inst, uint64_t Target,
   }
 
   DEBUG(dbgs() << " #" << NumOfPGOICallPromotion << " Promote the icall to "
-               << Symtab->getFuncName(Target) << "\n");
-  TargetFunction = DirectCallee;
+               << DirectCallee->getName() << "\n");
+
   return OK;
 }
 
@@ -348,6 +358,14 @@ ICallPromotionFunc::getPromotionCandidatesForCallSite(
   return Ret;
 }
 
+// Return the textual representation of a Value in a std::string
+static std::string print(Value *V) {
+  std::string Vdump;
+  raw_string_ostream sos(Vdump);
+  V->print(sos);
+  return Vdump;
+}
+
 // Create a diamond structure for If_Then_Else. Also update the profile
 // count. Do the fix-up for the invoke instruction.
 static void createIfThenElse(Instruction *Inst, Function *DirectCallee,
@@ -376,11 +394,11 @@ static void createIfThenElse(Instruction *Inst, Function *DirectCallee,
   SplitBlockAndInsertIfThenElse(PtrCmp, Inst, &ThenTerm, &ElseTerm,
                                 BranchWeights);
   *DirectCallBB = ThenTerm->getParent();
-  (*DirectCallBB)->setName("if.true.direct_targ");
+  (*DirectCallBB)->setName("icp.direct." + DirectCallee->getName());
   *IndirectCallBB = ElseTerm->getParent();
-  (*IndirectCallBB)->setName("if.false.orig_indirect");
+  (*IndirectCallBB)->setName("icp.indirect");
   *MergeBB = Inst->getParent();
-  (*MergeBB)->setName("if.end.icp");
+  (*MergeBB)->setName("icp.merge");
 
   // Special handing of Invoke instructions.
   InvokeInst *II = dyn_cast<InvokeInst>(Inst);
@@ -668,6 +686,7 @@ bool ICallPromotionFunc::processFunctionPGO() {
 
 // Traverse all the indirect-call callsite and get static candidates to perform
 // indirect-call promotion.
+// TODO: be smarter about the set of possible callees at each callsite
 bool ICallPromotionFunc::processFunctionStatic() {
   bool Changed = false;
   std::vector<PromotionCandidate> PromotionCandidates;
@@ -676,7 +695,9 @@ bool ICallPromotionFunc::processFunctionStatic() {
     PromotionCandidates.clear();
     CallSite CS(I);
 
+    DEBUG(dbgs() << "icp-candidate:" << print(I) << "\n");
     for (Function &candidate: *F.getParent()) {
+      // TODO: replace the function type check with !isPromotionLegal(I, &candidate)
       if (CS.getFunctionType() != candidate.getFunctionType())
         continue;
       if (CS.getCallingConv() != candidate.getCallingConv())
@@ -686,10 +707,24 @@ bool ICallPromotionFunc::processFunctionStatic() {
       PromotionCandidates.push_back(PromotionCandidate(&candidate, 1));
       if (PromotionCandidates.size() > MaxNumPromotions)
         break;
+      DEBUG(dbgs() << "icp-candidate:   " << candidate.getName() << "\n");
     }
 
-    if (PromotionCandidates.size() > MaxNumPromotions)
+    if (PromotionCandidates.size() > MaxNumPromotions) {
+      emitOptimizationRemarkMissed(
+          F.getContext(), "PGOIndirectCallPromotion", F, I->getDebugLoc(),
+          Twine("Skipping callsite") + print(I) + ": too many static candidates");
+      NumOfPGOICallsitesSkipped++;
       continue;
+    }
+
+    if (PromotionCandidates.size() == 0) {
+      emitOptimizationRemarkMissed(
+          F.getContext(), "PGOIndirectCallPromotion", F, I->getDebugLoc(),
+          Twine("Skipping callsite") + print(I) + ": no static candidates");
+      NumOfPGOICallsitesSkipped++;
+      continue;
+    }
 
     uint64_t TotalCount = PromotionCandidates.size();
     uint32_t NumPromoted = tryToPromote(I, PromotionCandidates, TotalCount);
