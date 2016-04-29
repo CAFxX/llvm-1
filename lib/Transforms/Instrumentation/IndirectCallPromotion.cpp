@@ -110,6 +110,11 @@ static cl::opt<bool>
     ICPDUMPAFTER("icp-dumpafter", cl::init(false), cl::Hidden,
                  cl::desc("Dump IR after transformation happens"));
 
+// Ignore profile data: statically find candidates for promotion
+static cl::opt<bool>
+   ICPIgnoreProf("icp-ignore-prof", cl::init(false), cl::Hidden,
+                cl::desc("Ignore profiling data"));
+
 namespace {
 class PGOIndirectCallPromotion : public ModulePass {
 public:
@@ -224,6 +229,9 @@ private:
   // Noncopyable
   ICallPromotionFunc(const ICallPromotionFunc &other) = delete;
   ICallPromotionFunc &operator=(const ICallPromotionFunc &other) = delete;
+
+  bool processFunctionPGO();
+  bool processFunctionStatic();
 
 public:
   ICallPromotionFunc(Function &Func, Module *Modu, InstrProfSymtab *Symtab)
@@ -627,7 +635,7 @@ uint32_t ICallPromotionFunc::tryToPromote(
 
 // Traverse all the indirect-call callsite and get the value profile
 // annotation to perform indirect-call promotion.
-bool ICallPromotionFunc::processFunction() {
+bool ICallPromotionFunc::processFunctionPGO() {
   bool Changed = false;
   for (auto &I : findIndirectCallSites(F)) {
     uint32_t NumVals;
@@ -656,6 +664,44 @@ bool ICallPromotionFunc::processFunction() {
                       IPVK_IndirectCallTarget, MaxNumPromotions);
   }
   return Changed;
+}
+
+// Traverse all the indirect-call callsite and get static candidates to perform
+// indirect-call promotion.
+bool ICallPromotionFunc::processFunctionStatic() {
+  bool Changed = false;
+  std::vector<PromotionCandidate> PromotionCandidates;
+
+  for (auto &I : findIndirectCallSites(F)) {
+    PromotionCandidates.clear();
+    CallSite CS(I);
+
+    for (Function &candidate: *F.getParent()) {
+      if (CS.getFunctionType() != candidate.getFunctionType())
+        continue;
+      if (CS.getCallingConv() != candidate.getCallingConv())
+        continue;
+      if (!candidate.hasAddressTaken())
+        continue;
+      PromotionCandidates.push_back(PromotionCandidate(&candidate, 1));
+      if (PromotionCandidates.size() > MaxNumPromotions)
+        break;
+    }
+
+    if (PromotionCandidates.size() > MaxNumPromotions)
+      continue;
+
+    uint64_t TotalCount = PromotionCandidates.size();
+    uint32_t NumPromoted = tryToPromote(I, PromotionCandidates, TotalCount);
+
+    Changed |= NumPromoted > 0;
+  }
+  return Changed;
+}
+
+// Traverse all the indirect-call callsite and perform indirect-call promotion.
+bool ICallPromotionFunc::processFunction() {
+  return ICPIgnoreProf ? processFunctionStatic() : processFunctionPGO();
 }
 
 // A wrapper function that does the actual work.
